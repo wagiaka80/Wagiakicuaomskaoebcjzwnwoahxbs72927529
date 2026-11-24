@@ -2271,6 +2271,7 @@ function Library:CreateWindow(title)
 	local currentTab
 	local tabY = 35
 	local tabOrderList = {}
+	local tabFrameList = {} -- parallel list: Tab ScrollingFrame per button
 
 	local windowFunctions = {}
 
@@ -2289,6 +2290,7 @@ function Library:CreateWindow(title)
 		table.insert(tabOrderList, btn)
 
 		local Tab = Instance.new("ScrollingFrame")
+		table.insert(tabFrameList, Tab) -- store parallel so index matches btn
 		Tab.Size = UDim2.new(1, 0, 1, 0)
 		Tab.Visible = false
 		Tab.Parent = contentFrame
@@ -2564,10 +2566,26 @@ function Library:CreateWindow(title)
 		end
 	end)
 
-	task.defer(function()
-		if tabOrderList[1] then
-			firesignal(tabOrderList[1].MouseButton1Click)
+	-- Kích hoạt tab đầu tiên trực tiếp — không dùng firesignal (không phải mọi executor có)
+	local function activateTab(idx)
+		local btn = tabOrderList[idx]
+		local tab = tabFrameList[idx]
+		if not (btn and tab) then return end
+		for _, child in ipairs(sidebarFrame:GetChildren()) do
+			if child:IsA("TextButton") then
+				child.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+				child.TextColor3 = currentColor
+			end
 		end
+		btn.BackgroundColor3 = currentColor
+		btn.TextColor3 = Color3.fromRGB(0, 0, 0)
+		if currentTab then currentTab.Visible = false end
+		currentTab = tab
+		tab.Visible = true
+	end
+
+	task.defer(function()
+		activateTab(1)
 	end)
 
 	return windowFunctions
