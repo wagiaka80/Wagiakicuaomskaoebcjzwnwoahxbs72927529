@@ -2,7 +2,7 @@
 -- SUNSET UI + OLLIE 99 NIGHTS (COMPLETE & OPTIMIZED)
 -- TP Auto Chop (Exact Tree Name Filter + Anti-Lose Axe Fix)
 -- Independent Kill Aura + Conflict Warning | Auto Rescue Children
--- Cached Chest + Ammo + Coins | Zero-Lag Mobile Ready
+-- Cached Chest + Ammo + Coins | Auto Scrap to Scrapper (Unlimited, Continuous)
 --========================================================
 
 local Players      = game:GetService("Players")
@@ -68,14 +68,19 @@ local SACK_NAMES = {
 	"Admin Sack","Strong Sack","Good Sack","Old Sack","Sack","Bag",
 }
 local FOOD_ITEMS  = { "Berry","Carrot","Apple","Corn","Pumpkin","Chili" }
+
+-- SCRAP_ITEMS: used for auto-TP to Scrapper (unlimited, continuous scan)
 local SCRAP_ITEMS = {
-	"Log","Chair","Bolt","Sheet Metal","Broken Fan","Broken Radio",
+	"Bolt","Sheet Metal","Broken Fan","Broken Radio",
 	"Broken Microwave","Washing Machine","Tires & Engines",
 }
+
+-- FUEL_EXACT: Log và Chair đã bị xóa theo yêu cầu
 local FUEL_EXACT = {
-	"Log","Chair","Biofuel","Coal",
+	"Biofuel","Coal",
 	"Purple Fur Tuft","Fuel Canister","Oil Barrel",
 }
+
 local CHEST_KEYS = { "Chest", "Crate", "Supply", "Loot" }
 local COIN_KEYS  = { "Coin" }
 local AMMO_KEYS  = { "Ammo", "Bullet", "Shell", "Arrow", "Dart", "Rocket", "Cartridge" }
@@ -83,6 +88,8 @@ local IGNORE_LOOT_KEYS = {
 	"Tree","Pine","Oak","Birch","Fir","Bush","Foliage","Wall","Floor","Ground",
 	"Terrain","Campfire","MainFire","Spawn","Part","Baseplate","Hitbox"
 }
+-- Keys used to identify the Scrapper machine
+local SCRAPPER_KEYS = { "Scrapper", "ScrapMachine", "Recycler", "Grinder" }
 
 local CFG = {
 	Speed=false,            WalkSpeed=40,
@@ -96,6 +103,7 @@ local CFG = {
 	AutoChestAndLoot=false,
 	AutoCollectCoins=false,
 	AutoRescueChild=false,
+	AutoScrapToScrapper=false,
 	ESPChild=false,
 	Fullbright=false,
 	FixLag=false,
@@ -144,7 +152,6 @@ local function partOf(m)
 	if m:IsA("BasePart") then return m end
 	if m:IsA("Model") then
 		if m.PrimaryPart then return m.PrimaryPart end
-		-- Ưu tiên lấy phần thân cây / hitbox nếu có
 		for _, child in ipairs(m:GetDescendants()) do
 			if child:IsA("BasePart") and hasKey(child.Name, { "Trunk", "Wood", "Log", "Hitbox", "Stem" }) then
 				return child
@@ -226,6 +233,24 @@ local function getFirePart()
 			local p = partOf(o)
 			if p then
 				cachedFirePart = p
+				return p
+			end
+		end
+	end
+	return nil
+end
+
+-- Find the Scrapper machine anywhere in the workspace
+local cachedScrapperPart = nil
+local function getScrapperPart()
+	if cachedScrapperPart and cachedScrapperPart.Parent then
+		return cachedScrapperPart
+	end
+	for _, o in ipairs(Workspace:GetDescendants()) do
+		if hasKey(o.Name, SCRAPPER_KEYS) then
+			local p = partOf(o)
+			if p then
+				cachedScrapperPart = p
 				return p
 			end
 		end
@@ -449,7 +474,8 @@ local chestLootStatusLbl  = nil
 local cachedChests    = {}
 local openedChestDone = setmetatable({}, { __mode = "k" })
 local failedChestAt   = {}
-local lootedItems     = setmetatable({}, { __mode = "k" })
+-- Strong table: không để GC xóa record → tránh spam lấy lại item đã lấy
+local lootedItems     = {}
 local failedLootAt    = {}
 local claimedAmmo     = setmetatable({}, { __mode = "k" })
 local failedAmmoAt    = {}
@@ -463,6 +489,38 @@ local STEP_WAIT_SECONDS   = 2
 local totalChestsOpened  = 0
 local totalItemsLooted   = 0
 local totalAmmoCollected = 0
+
+-- Tên item đã có trong inventory (chỉ lấy 1 lần mỗi tên mỗi phiên mở rương)
+local invNameOwned = {}
+-- Số lần thất bại liên tiếp → trigger TP về lửa trại
+local consecutiveLootFail = 0
+local CONSEC_FAIL_THRESHOLD = 5
+
+-- Xây bảng tên từ inventory hiện tại
+local function rebuildInvNameOwned()
+	invNameOwned = {}
+	local inv  = Player:FindFirstChild("Inventory")
+	local char = Player.Character
+	if inv then
+		for _, item in ipairs(inv:GetChildren()) do
+			local ok, n = pcall(function() return item.Name end)
+			if ok and n then invNameOwned[n] = true end
+		end
+	end
+	if char then
+		for _, item in ipairs(char:GetChildren()) do
+			if item:IsA("Tool") then
+				local ok, n = pcall(function() return item.Name end)
+				if ok and n then invNameOwned[n] = true end
+			end
+		end
+	end
+end
+
+-- Kiểm tra tên item đã có trong balo/người chưa
+local function isNameAlreadyOwned(itemName)
+	return invNameOwned[itemName] == true
+end
 
 local function updateChestLootStatus(txt)
 	chestLootStatusText = txt
@@ -618,7 +676,12 @@ end
 
 local function isLootSkipped(item, now)
 	if not item or not item.Parent then return true end
+	-- Đã lấy thành công rồi → bỏ qua
 	if lootedItems[item] then return true end
+	-- Tên item này đã có trong balo → không lấy thêm
+	local okN, itemName = pcall(function() return item.Name end)
+	if okN and itemName and isNameAlreadyOwned(itemName) then return true end
+	-- Vừa thất bại gần đây → đợi cooldown
 	local failT = failedLootAt[item]
 	if failT and (now - failT) < LOOT_FAIL_COOLDOWN then
 		return true
@@ -689,6 +752,19 @@ end
 
 local function tryLootSingleItem(item)
 	if not HotbarItemRF then return false end
+
+	-- Lấy tên item trước khi gửi lên server
+	local okN, itemName = pcall(function() return item.Name end)
+	if not okN then return false end
+
+	-- Kiểm tra balo lần cuối trước khi gọi server
+	rebuildInvNameOwned()
+	if isNameAlreadyOwned(itemName) then
+		-- Đánh dấu luôn để không quét lại
+		lootedItems[item] = true
+		return true -- coi như "đã có" = thành công, không spam
+	end
+
 	local inv = Player:FindFirstChild("Inventory")
 	local beforeCount = inv and #inv:GetChildren() or 0
 
@@ -708,10 +784,17 @@ local function tryLootSingleItem(item)
 		return false
 	end
 
-	local nowInInv = (inv and item.Parent == inv) or (item.Parent == Player.Character)
+	-- Xác nhận item thực sự đã vào balo/người
+	local nowInInv  = (inv and item.Parent == inv) or (item.Parent == Player.Character)
 	local afterCount = inv and #inv:GetChildren() or 0
+	local landed = nowInInv or afterCount > beforeCount or not item.Parent
 
-	return nowInInv or afterCount > beforeCount or not item.Parent
+	if landed then
+		-- Cập nhật bảng tên để các item cùng tên không bị lấy thêm lần nữa
+		invNameOwned[itemName] = true
+	end
+
+	return landed
 end
 
 local function openSingleChest(chest)
@@ -720,7 +803,21 @@ local function openSingleChest(chest)
 	return ok == true
 end
 
+-- Fallback: TP về lửa trại khi thất bại quá nhiều lần liên tiếp
+local function tpToCampfireFallback(reason)
+	local fp = getFirePart()
+	local r  = root()
+	if fp and r then
+		r.CFrame = CFrame.new(fp.Position + Vector3.new(0, 4, 0))
+		updateChestLootStatus("🔥 TP lửa trại — " .. reason)
+	end
+	consecutiveLootFail = 0
+end
+
 local function lootItemsAtChest(chest, chestPos)
+	-- Làm mới bảng tên inventory trước mỗi lần loot để không lấy đồ trùng
+	rebuildInvNameOwned()
+
 	local now = os.clock()
 	local items = scanLootAtChestPos(chestPos, chest, now)
 	if #items == 0 then
@@ -731,15 +828,25 @@ local function lootItemsAtChest(chest, chestPos)
 	for i = 1, math.min(#items, 15) do
 		if not CFG.AutoChestAndLoot then break end
 		local item = items[i]
-		if isLootSkipped(item, os.clock()) then continue end
+		if isLootSkipped(item, os.clock()) then
+			skipped += 1
+			continue
+		end
 
 		if tryLootSingleItem(item) then
 			lootedItems[item] = true
 			grabbed += 1
 			totalItemsLooted += 1
+			consecutiveLootFail = 0
 		else
 			failedLootAt[item] = os.clock()
 			skipped += 1
+			consecutiveLootFail += 1
+			-- Nếu thất bại liên tiếp quá ngưỡng → TP về lửa trại
+			if consecutiveLootFail >= CONSEC_FAIL_THRESHOLD then
+				tpToCampfireFallback(string.format("thất bại %d lần liên tiếp", consecutiveLootFail))
+				return grabbed, skipped
+			end
 		end
 		task.wait(0.06)
 	end
@@ -946,6 +1053,157 @@ task.spawn(function()
 end)
 
 --========================================================
+-- AUTO SCRAP TO SCRAPPER — liên tục quét toàn map, không giới hạn số lượng
+--========================================================
+
+local scrapStatusText = "Chờ bật auto nguyên liệu → Scrapper..."
+local scrapStatusLbl  = nil
+local totalScrapSent  = 0
+local droppedScrapAt  = {}
+local SCRAP_DROP_COOLDOWN = 20
+
+local function updateScrapStatus(txt)
+	scrapStatusText = txt
+	if scrapStatusLbl and scrapStatusLbl.Parent then
+		scrapStatusLbl.Text = txt
+	end
+end
+
+-- Liên tục quét toàn workspace + nil instances để tìm nguyên liệu sắt
+-- Không giới hạn số lượng — xử lý hết tất cả tìm được mỗi chu kỳ
+local function scanAllScrapItems()
+	local found, seen = {}, {}
+	local ch = Player.Character
+	local inv = Player:FindFirstChild("Inventory")
+	local now = os.clock()
+
+	local function tryAdd(o)
+		if not o or seen[o] then return end
+		if ch and o:IsDescendantOf(ch) then return end
+		if inv and o:IsDescendantOf(inv) then return end
+		if Players:GetPlayerFromCharacter(o) then return end
+		if (droppedScrapAt[o] or 0) + SCRAP_DROP_COOLDOWN > now then return end
+
+		local okName, name = pcall(function() return o.Name end)
+		if not okName then return end
+		if not matchesExact(name, SCRAP_ITEMS) then return end
+		if not o.Parent then return end
+
+		seen[o] = true
+		local p = partOf(o)
+		if p then table.insert(found, { obj = o, p = p }) end
+	end
+
+	-- Quét toàn workspace (Items folder ưu tiên, fallback toàn bộ)
+	local itemsFolder = Workspace:FindFirstChild("Items")
+	if itemsFolder then
+		for _, o in ipairs(itemsFolder:GetDescendants()) do
+			tryAdd(o)
+		end
+	else
+		for _, o in ipairs(Workspace:GetDescendants()) do
+			tryAdd(o)
+		end
+	end
+
+	-- Quét thêm nil instances (item đã được nhặt ra khỏi workspace nhưng server vẫn còn)
+	if getnilinstances then
+		local ok, nilList = pcall(getnilinstances)
+		if ok and nilList then
+			for _, o in ipairs(nilList) do
+				tryAdd(o)
+			end
+		end
+	end
+
+	return found
+end
+
+local function dumpAllScrapToScrapper()
+	if not (DragRE and StopDragRE) then
+		updateScrapStatus("❌ Thiếu remote DragRE / StopDragRE")
+		return 0
+	end
+
+	-- Làm mới cache Scrapper mỗi chu kỳ (phòng map reload)
+	cachedScrapperPart = nil
+	local sp = getScrapperPart()
+	if not sp then
+		updateScrapStatus("⚠️ Không tìm thấy Scrapper trên map (tìm: " .. table.concat(SCRAPPER_KEYS, ", ") .. ")")
+		return 0
+	end
+
+	local items = scanAllScrapItems()
+	if #items == 0 then
+		updateScrapStatus(string.format("⚠️ Không tìm thấy nguyên liệu sắt · Tổng: %d", totalScrapSent))
+		return 0
+	end
+
+	updateScrapStatus(string.format("⚙️ Tìm thấy %d nguyên liệu, đang TP → Scrapper...", #items))
+
+	local sent = 0
+	for i, item in ipairs(items) do
+		if not CFG.AutoScrapToScrapper then break end
+
+		local o = item.obj
+		local okAlive = pcall(function() return o.Name end)
+		if not okAlive or not o.Parent then continue end
+
+		-- Cập nhật vị trí Scrapper trước mỗi lần thả (phòng di chuyển)
+		local currentSP = getScrapperPart()
+		if not currentSP then break end
+
+		local spreadX = ((sent % 4) - 1.5) * 1.2
+		local spreadZ = (math.floor(sent / 4) % 4 - 1.5) * 1.2
+		local goalPos = currentSP.Position + Vector3.new(spreadX, 2 + math.floor(sent / 16) * 0.5, spreadZ)
+		local goalCF  = CFrame.new(goalPos)
+
+		if o:IsA("Model") then
+			if not o.PrimaryPart then
+				pcall(function() o.PrimaryPart = partOf(o) end)
+			end
+			pcall(DragRE.FireServer, DragRE, o)
+			if o.PrimaryPart then
+				pcall(function() o:SetPrimaryPartCFrame(goalCF) end)
+			else
+				pcall(function() o:PivotTo(goalCF) end)
+			end
+		elseif o:IsA("BasePart") then
+			pcall(DragRE.FireServer, DragRE, o)
+			pcall(function() o.CFrame = goalCF end)
+		end
+		task.wait(0.04)
+		pcall(StopDragRE.FireServer, StopDragRE, o)
+
+		droppedScrapAt[o] = os.clock()
+		sent += 1
+		totalScrapSent += 1
+
+		if sent % 20 == 0 then
+			updateScrapStatus(string.format("⚙️ Đang gửi... %d/%d (Tổng: %d)", sent, #items, totalScrapSent))
+			task.wait(0.05)
+		else
+			task.wait(0.07)
+		end
+	end
+
+	updateScrapStatus(string.format("✅ Gửi %d nguyên liệu → Scrapper (Tổng: %d)", sent, totalScrapSent))
+	return sent
+end
+
+-- Vòng lặp liên tục quét map — không nghỉ
+task.spawn(function()
+	while true do
+		if CFG.AutoScrapToScrapper then
+			pcall(dumpAllScrapToScrapper)
+			task.wait(3.0) -- quét lại sau 3 giây để bắt item mới spawn
+		else
+			task.wait(0.5)
+		end
+	end
+end)
+
+--========================================================
 -- COUNTER, KILL AURA & TP AUTO CHOP (EXACT TREE NAMES + ANTI-LOSE AXE FIX)
 --========================================================
 
@@ -963,12 +1221,14 @@ Workspace.ChildAdded:Connect(function(c)
 	if c.Name == "Map" then
 		resetCounter()
 		cachedFirePart = nil
+		cachedScrapperPart = nil
 	end
 end)
 Workspace.ChildRemoved:Connect(function(c)
 	if c.Name == "Map" then
 		resetCounter()
 		cachedFirePart = nil
+		cachedScrapperPart = nil
 	end
 end)
 
@@ -1020,7 +1280,6 @@ local function equipToolSafe(tool)
 end
 
 local function unequipToolSafe(tool)
-	-- Chỉ unequip nếu tool vẫn tồn tại hợp lệ và đang thực sự cầm trên Character
 	if not (UnequipRE and isToolValid(tool)) then return end
 	if not isToolEquippedOnChar(tool) then return end
 	pcall(UnequipRE.FireServer, UnequipRE, "FireAllClients", tool)
@@ -1030,7 +1289,6 @@ local function unequipToolSafe(tool)
 	task.wait(0.05)
 end
 
--- Chỉ gửi lệnh Equip nếu rìu chưa được cầm trên Character (tránh spam Equip gây mất rìu)
 local function equipChopToolOnce(tool)
 	if not (EquipRE and isToolValid(tool)) then return false end
 	if isToolEquippedOnChar(tool) then
@@ -1049,7 +1307,6 @@ local function swingBatch(tool, targets)
 	if not (EquipRE and UnequipRE and DamageRF) or #targets == 0 then return end
 	if not isToolValid(tool) then return end
 
-	-- Nếu AutoChop đang giữ rìu thì không để KillAura tự ý unequip làm mất đồng bộ
 	local sharedWithChop = isChoppingNow and (lastEquippedChopTool == tool)
 
 	equipToolSafe(tool)
@@ -1122,7 +1379,6 @@ local function findNilEquivalent(targetName, targetDebugId)
 	return nil
 end
 
--- Kiểm tra xem cây đã gãy hoặc bị phá hủy chưa
 local function isTreeBroken(treeModel, treePart)
 	if not treeModel or not treeModel.Parent then return true end
 	if not treePart or not treePart.Parent then return true end
@@ -1145,7 +1401,6 @@ local function isTreeBroken(treeModel, treePart)
 	return false
 end
 
--- Chuẩn hóa chuỗi để so khớp linh hoạt (bỏ khoảng trắng/chữ hoa thường)
 local function normalizeName(str)
 	if type(str) ~= "string" then return "" end
 	return string.lower(string.gsub(str, "%s+", ""))
@@ -1163,16 +1418,11 @@ local function isBigTreeName(name)
 		or string.find(n, "treebig2", 1, true) ~= nil
 end
 
--- Chỉ Strong Axe, Chainsaw, Admin Axe mới chặt được treebig1 và treebig2
 local function canChopBigTree(tool)
 	if not tool then return false end
 	return HEAVY_AXES[tool.Name] == true
 end
 
--- Trả về:
---   "normal" -> Small Tree (mọi rìu chặt được)
---   "big"    -> treebig1, treebig 2 (chỉ Strong Axe, Chainsaw, Admin Axe)
---   nil      -> không phải loại cây hợp lệ hoặc đã gãy
 local function classifyTree(treeModel)
 	if not treeModel or not treeModel.Parent or not treeModel:IsA("Model") then
 		return nil
@@ -1210,7 +1460,7 @@ local function getTrees(r, maxRadius, tool)
 			return
 		end
 		if treeType == "big" and not allowBig then
-			return -- Không có Strong Axe / Chainsaw / Admin Axe thì bỏ qua treebig1 & treebig 2
+			return
 		end
 
 		local p = partOf(t); if not p then return end
@@ -1311,12 +1561,10 @@ local function tpToTreeAndChop(treeModel, treePart, initialTool)
 	local failedHits = 0
 	local spamWait = math.min(math.max(CFG.Delay or 0.06, 0.05), 0.12)
 
-	-- Spam ToolDamageObject liên tục cho đến khi cây gãy hẳn mới chuyển cây khác
 	while CFG.AutoChop and not isTreeBroken(treeModel, treePart) and swings < maxSwings do
 		local rr = root()
 		if not rr then break end
 
-		-- Kiểm tra rìu đang khóa còn hợp lệ không; chỉ tìm rìu khác nếu rìu cũ không còn
 		if not isToolValid(lockedTool) then
 			local fallback = getChopTool()
 			if not isToolValid(fallback) then break end
@@ -1349,7 +1597,7 @@ local function tpToTreeAndChop(treeModel, treePart, initialTool)
 	return isTreeBroken(treeModel, treePart)
 end
 
--- Luồng riêng cho Kill Aura
+-- Kill Aura loop
 task.spawn(function()
 	while true do
 		if CFG.KillAura then
@@ -1367,7 +1615,7 @@ task.spawn(function()
 	end
 end)
 
--- Luồng riêng cho TP Auto Chop
+-- TP Auto Chop loop
 task.spawn(function()
 	while true do
 		if CFG.AutoChop then
@@ -1393,7 +1641,6 @@ task.spawn(function()
 			end
 			task.wait(0.12)
 		else
-			-- Không tự động gọi unequipToolSafe khi tắt AutoChop để tránh server xóa/desync rìu
 			isChoppingNow = false
 			lastEquippedChopTool = nil
 			task.wait(0.25)
@@ -1746,7 +1993,7 @@ local function pullAllExact(nameList)
 	end
 	table.sort(found, function(a,b) return a.dist < b.dist end)
 	local count = 0
-	for i = 1, math.min(#found, 20) do
+	for i = 1, #found do
 		if not (DragRE and StopDragRE) then break end
 		local o  = found[i].obj
 		local rr = root(); if not rr then break end
@@ -2541,16 +2788,29 @@ do
 	local sFire = TabItems:AddSection("LỬA TRẠI & NHIÊN LIỆU")
 	sFire:AddButton("🔥 TP Lửa trại", tpCampfire)
 	sFire:AddToggle("Auto dồn nhiên liệu → Lửa", CFG.AutoDrop, function(v) CFG.AutoDrop = v end)
-	sFire:AddButton("🪵 Dồn nhiên liệu → Lửa ngay", function()
+	sFire:AddLabel("⚠️ Nhiên liệu: Biofuel, Coal, Purple Fur Tuft, Fuel Canister, Oil Barrel")
+	sFire:AddButton("⛽ Dồn nhiên liệu → Lửa ngay", function()
 		task.spawn(function() dumpFuelToFire() end)
+	end)
+
+	local sScrapper = TabItems:AddSection("NGUYÊN LIỆU SẮT → SCRAPPER (AUTO LIÊN TỤC)")
+	sScrapper:AddLabel("⚙️ Bolt, Sheet Metal, Broken Fan, Radio, Microwave, Washing Machine, Tires & Engines")
+	sScrapper:AddToggle("Auto TP nguyên liệu → Scrapper", CFG.AutoScrapToScrapper, function(v)
+		CFG.AutoScrapToScrapper = v
+		if v then
+			task.spawn(function() dumpAllScrapToScrapper() end)
+		else
+			updateScrapStatus(string.format("Tắt · Tổng đã gửi: %d", totalScrapSent))
+		end
+	end)
+	scrapStatusLbl = sScrapper:AddLabel(scrapStatusText)
+	sScrapper:AddButton("🔧 Gửi ngay 1 lần", function()
+		task.spawn(function() dumpAllScrapToScrapper() end)
 	end)
 
 	local sPull = TabItems:AddSection("KÉO VẬT PHẨM VỀ NGƯỜI")
 	sPull:AddButton("🍎 Kéo thức ăn", function()
 		task.spawn(function() pullAllExact(FOOD_ITEMS) end)
-	end)
-	sPull:AddButton("⚙️ Kéo nguyên liệu (Log, Chair...)", function()
-		task.spawn(function() pullAllExact(SCRAP_ITEMS) end)
 	end)
 
 	local sPlr = TabItems:AddSection("NGƯỜI CHƠI")
@@ -2591,5 +2851,5 @@ do
 end
 
 print("========================================")
-print(" SUNSET UI + 99 NIGHTS COMPLETE LOADED ✓")
+print(" SUNSET UI + 99 NIGHTS v2 COMPLETE LOADED ✓")
 print("========================================")
